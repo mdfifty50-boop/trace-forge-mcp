@@ -1,18 +1,11 @@
 /**
- * In-memory trace store with structured trace trees.
- * All data lives in Maps — no persistence layer, no dependencies.
+ * SQLite-backed trace store.
+ * All function signatures are identical to the original in-memory version —
+ * drop-in replacement; no changes required in index.js or tests.
  */
 
 import { randomUUID } from 'node:crypto';
-
-/** @type {Map<string, object>} trace_id -> trace object */
-const traces = new Map();
-
-/** @type {Map<string, object>} span_id -> span object */
-const spans = new Map();
-
-/** @type {Map<string, object[]>} trace_id -> events[] */
-const events = new Map();
+import db from './db.js';
 
 // ═══════════════════════════════════════════
 // TRACE LIFECYCLE
@@ -22,25 +15,16 @@ export function startTrace(agent_id, task_description, metadata = {}) {
   const trace_id = randomUUID();
   const started_at = new Date().toISOString();
 
-  traces.set(trace_id, {
-    trace_id,
-    agent_id,
-    task_description,
-    metadata,
-    status: 'active',
-    started_at,
-    ended_at: null,
-    outcome: null,
-    summary: null,
-  });
-
-  events.set(trace_id, []);
+  db.prepare(`
+    INSERT INTO traces (trace_id, agent_id, task_description, status, started_at, metadata_json)
+    VALUES (?, ?, ?, 'active', ?, ?)
+  `).run(trace_id, agent_id, task_description, started_at, JSON.stringify(metadata));
 
   return { trace_id, started_at };
 }
 
 export function endTrace(trace_id, outcome, summary = null) {
-  const trace = traces.get(trace_id);
+  const trace = db.prepare('SELECT * FROM traces WHERE trace_id = ?').get(trace_id);
   if (!trace) {
     return { error: `Trace ${trace_id} not found` };
   }
@@ -51,25 +35,21 @@ export function endTrace(trace_id, outcome, summary = null) {
   const ended_at = new Date().toISOString();
   const duration_ms = new Date(ended_at).getTime() - new Date(trace.started_at).getTime();
 
-  const traceEvents = events.get(trace_id) || [];
-  const traceSpans = [];
-  for (const [, span] of spans) {
-    if (span.trace_id === trace_id) traceSpans.push(span);
-  }
+  db.prepare(`
+    UPDATE traces SET status = ?, ended_at = ?, outcome = ?, summary = ? WHERE trace_id = ?
+  `).run(outcome, ended_at, outcome, summary, trace_id);
 
-  const tool_calls = traceEvents.filter(e => e.type === 'tool_call').length;
-
-  trace.status = outcome;
-  trace.ended_at = ended_at;
-  trace.outcome = outcome;
-  trace.summary = summary;
+  const spans_count = db.prepare('SELECT COUNT(*) as c FROM spans WHERE trace_id = ?').get(trace_id).c;
+  const tool_calls_count = db.prepare('SELECT COUNT(*) as c FROM tool_calls WHERE trace_id = ?').get(trace_id).c;
+  const decisions_count = db.prepare('SELECT COUNT(*) as c FROM decisions WHERE trace_id = ?').get(trace_id).c;
+  const events_count = tool_calls_count + decisions_count;
 
   return {
     trace_id,
     duration_ms,
-    events_count: traceEvents.length,
-    spans_count: traceSpans.length,
-    tool_calls_count: tool_calls,
+    events_count,
+    spans_count,
+    tool_calls_count,
   };
 }
 
@@ -78,26 +58,25 @@ export function endTrace(trace_id, outcome, summary = null) {
 // ═══════════════════════════════════════════
 
 export function createSpan(trace_id, span_name, parent_span_id = null, metadata = {}) {
-  const trace = traces.get(trace_id);
+  const trace = db.prepare('SELECT trace_id FROM traces WHERE trace_id = ?').get(trace_id);
   if (!trace) {
     return { error: `Trace ${trace_id} not found` };
   }
 
-  const span_id = randomUUID();
-  const created_at = new Date().toISOString();
-
-  if (parent_span_id && !spans.has(parent_span_id)) {
-    return { error: `Parent span ${parent_span_id} not found` };
+  if (parent_span_id) {
+    const parent = db.prepare('SELECT span_id FROM spans WHERE span_id = ?').get(parent_span_id);
+    if (!parent) {
+      return { error: `Parent span ${parent_span_id} not found` };
+    }
   }
 
-  spans.set(span_id, {
-    span_id,
-    trace_id,
-    span_name,
-    parent_span_id,
-    metadata,
-    created_at,
-  });
+  const span_id = randomUUID();
+  const started_at = new Date().toISOString();
+
+  db.prepare(`
+    INSERT INTO spans (span_id, trace_id, parent_span_id, span_name, status, started_at, metadata_json)
+    VALUES (?, ?, ?, ?, 'active', ?, ?)
+  `).run(span_id, trace_id, parent_span_id || null, span_name, started_at, JSON.stringify(metadata));
 
   return { span_id, trace_id };
 }
@@ -107,66 +86,59 @@ export function createSpan(trace_id, span_name, parent_span_id = null, metadata 
 // ═══════════════════════════════════════════
 
 export function logToolCall(trace_id, span_id, tool_name, args, result_preview, tokens_used, duration_ms, status) {
-  const trace = traces.get(trace_id);
+  const trace = db.prepare('SELECT trace_id FROM traces WHERE trace_id = ?').get(trace_id);
   if (!trace) {
     return { error: `Trace ${trace_id} not found` };
   }
-  if (span_id && !spans.has(span_id)) {
-    return { error: `Span ${span_id} not found` };
+  if (span_id) {
+    const span = db.prepare('SELECT span_id FROM spans WHERE span_id = ?').get(span_id);
+    if (!span) {
+      return { error: `Span ${span_id} not found` };
+    }
   }
 
   const event_id = randomUUID();
-  const logged_at = new Date().toISOString();
+  const timestamp = new Date().toISOString();
+  const preview = (result_preview || '').slice(0, 500);
 
-  // Rough cost estimate: $3/1M input tokens for sonnet-class
-  let estimated_cost = null;
-  if (tokens_used) {
-    estimated_cost = parseFloat((tokens_used * 0.000003).toFixed(6));
-  }
-
-  const event = {
-    event_id,
-    type: 'tool_call',
+  db.prepare(`
+    INSERT INTO tool_calls (trace_id, span_id, tool_name, args_json, result_preview, tokens_used, duration_ms, status, timestamp)
+    VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)
+  `).run(
     trace_id,
-    span_id: span_id || null,
+    span_id || null,
     tool_name,
-    args,
-    result_preview: (result_preview || '').slice(0, 500),
-    tokens_used: tokens_used || null,
-    estimated_cost,
+    JSON.stringify(args || {}),
+    preview,
+    tokens_used || null,
     duration_ms,
     status,
-    logged_at,
-  };
-
-  const traceEvents = events.get(trace_id);
-  if (traceEvents) traceEvents.push(event);
+    timestamp
+  );
 
   return { event_id, logged: true };
 }
 
 export function logDecision(trace_id, reasoning, alternatives_considered, chosen_action, confidence) {
-  const trace = traces.get(trace_id);
+  const trace = db.prepare('SELECT trace_id FROM traces WHERE trace_id = ?').get(trace_id);
   if (!trace) {
     return { error: `Trace ${trace_id} not found` };
   }
 
   const event_id = randomUUID();
-  const logged_at = new Date().toISOString();
+  const timestamp = new Date().toISOString();
 
-  const event = {
-    event_id,
-    type: 'decision',
+  db.prepare(`
+    INSERT INTO decisions (trace_id, span_id, decision, rationale, alternatives_json, confidence, timestamp)
+    VALUES (?, NULL, ?, ?, ?, ?, ?)
+  `).run(
     trace_id,
-    reasoning,
-    alternatives_considered,
     chosen_action,
+    reasoning,
+    JSON.stringify(alternatives_considered || []),
     confidence,
-    logged_at,
-  };
-
-  const traceEvents = events.get(trace_id);
-  if (traceEvents) traceEvents.push(event);
+    timestamp
+  );
 
   return { event_id, logged: true };
 }
@@ -176,26 +148,60 @@ export function logDecision(trace_id, reasoning, alternatives_considered, chosen
 // ═══════════════════════════════════════════
 
 export function getTrace(trace_id) {
-  const trace = traces.get(trace_id);
+  const trace = db.prepare('SELECT * FROM traces WHERE trace_id = ?').get(trace_id);
   if (!trace) {
     return { error: `Trace ${trace_id} not found` };
   }
 
-  // Collect spans for this trace
-  const traceSpans = [];
-  for (const [, span] of spans) {
-    if (span.trace_id === trace_id) traceSpans.push(span);
-  }
+  const metadata = JSON.parse(trace.metadata_json || '{}');
 
-  // Build span tree
+  // Collect spans
+  const spanRows = db.prepare('SELECT * FROM spans WHERE trace_id = ?').all(trace_id);
+  const traceSpans = spanRows.map(s => ({
+    span_id: s.span_id,
+    trace_id: s.trace_id,
+    span_name: s.span_name,
+    parent_span_id: s.parent_span_id,
+    metadata: JSON.parse(s.metadata_json || '{}'),
+    created_at: s.started_at,
+  }));
+
   const spanTree = buildSpanTree(traceSpans);
 
-  // Collect events
-  const traceEvents = events.get(trace_id) || [];
-  const tool_calls = traceEvents.filter(e => e.type === 'tool_call');
-  const decisions = traceEvents.filter(e => e.type === 'decision');
+  // Collect tool calls
+  const toolCallRows = db.prepare('SELECT * FROM tool_calls WHERE trace_id = ? ORDER BY id').all(trace_id);
+  const tool_calls = toolCallRows.map(r => ({
+    event_id: randomUUID(),
+    type: 'tool_call',
+    trace_id: r.trace_id,
+    span_id: r.span_id,
+    tool_name: r.tool_name,
+    args: JSON.parse(r.args_json || '{}'),
+    result_preview: r.result_preview,
+    tokens_used: r.tokens_used,
+    estimated_cost: r.tokens_used ? parseFloat((r.tokens_used * 0.000003).toFixed(6)) : null,
+    duration_ms: r.duration_ms,
+    status: r.status,
+    logged_at: r.timestamp,
+  }));
 
-  // Calculate totals
+  // Collect decisions
+  const decisionRows = db.prepare('SELECT * FROM decisions WHERE trace_id = ? ORDER BY id').all(trace_id);
+  const decisions = decisionRows.map(r => ({
+    event_id: randomUUID(),
+    type: 'decision',
+    trace_id: r.trace_id,
+    reasoning: r.rationale,
+    alternatives_considered: JSON.parse(r.alternatives_json || '[]'),
+    chosen_action: r.decision,
+    confidence: r.confidence,
+    logged_at: r.timestamp,
+  }));
+
+  const allEvents = [...tool_calls, ...decisions].sort((a, b) =>
+    new Date(a.logged_at).getTime() - new Date(b.logged_at).getTime()
+  );
+
   const total_duration_ms = trace.ended_at
     ? new Date(trace.ended_at).getTime() - new Date(trace.started_at).getTime()
     : new Date().getTime() - new Date(trace.started_at).getTime();
@@ -204,41 +210,50 @@ export function getTrace(trace_id) {
   const total_cost = tool_calls.reduce((sum, e) => sum + (e.estimated_cost || 0), 0);
 
   return {
-    ...trace,
+    trace_id: trace.trace_id,
+    agent_id: trace.agent_id,
+    task_description: trace.task_description,
+    metadata,
+    status: trace.status,
+    started_at: trace.started_at,
+    ended_at: trace.ended_at,
+    outcome: trace.outcome,
+    summary: trace.summary,
     total_duration_ms,
-    total_events: traceEvents.length,
+    total_events: allEvents.length,
     total_spans: traceSpans.length,
     total_tool_calls: tool_calls.length,
     total_decisions: decisions.length,
     total_tokens,
     total_estimated_cost: parseFloat(total_cost.toFixed(6)),
     spans: spanTree,
-    events: traceEvents,
+    events: allEvents,
   };
 }
 
 export function searchTraces(agent_id = null, status = null, limit = 20) {
-  let results = [...traces.values()];
+  let query = 'SELECT * FROM traces WHERE 1=1';
+  const params = [];
 
   if (agent_id) {
-    results = results.filter(t => t.agent_id === agent_id);
+    query += ' AND agent_id = ?';
+    params.push(agent_id);
   }
   if (status) {
-    results = results.filter(t => t.status === status);
+    query += ' AND status = ?';
+    params.push(status);
   }
 
-  // Sort by recency (most recent first)
-  results.sort((a, b) => new Date(b.started_at).getTime() - new Date(a.started_at).getTime());
+  query += ' ORDER BY started_at DESC LIMIT ?';
+  params.push(limit);
 
-  // Apply limit
-  results = results.slice(0, limit);
+  const rows = db.prepare(query).all(...params);
 
-  return results.map(t => {
-    const traceEvents = events.get(t.trace_id) || [];
-    const traceSpans = [];
-    for (const [, span] of spans) {
-      if (span.trace_id === t.trace_id) traceSpans.push(span);
-    }
+  return rows.map(t => {
+    const tc = db.prepare('SELECT COUNT(*) as c FROM tool_calls WHERE trace_id = ?').get(t.trace_id).c;
+    const dc = db.prepare('SELECT COUNT(*) as c FROM decisions WHERE trace_id = ?').get(t.trace_id).c;
+    const sc = db.prepare('SELECT COUNT(*) as c FROM spans WHERE trace_id = ?').get(t.trace_id).c;
+    const events_count = tc + dc;
 
     const duration_ms = t.ended_at
       ? new Date(t.ended_at).getTime() - new Date(t.started_at).getTime()
@@ -253,8 +268,8 @@ export function searchTraces(agent_id = null, status = null, limit = 20) {
       started_at: t.started_at,
       ended_at: t.ended_at,
       duration_ms,
-      events_count: traceEvents.length,
-      spans_count: traceSpans.length,
+      events_count,
+      spans_count: sc,
     };
   });
 }
@@ -268,36 +283,27 @@ export function getRecentTraces() {
 }
 
 export function getStats() {
-  const allTraces = [...traces.values()];
-  const total = allTraces.length;
-  const active = allTraces.filter(t => t.status === 'active').length;
-  const completed = allTraces.filter(t => t.status !== 'active').length;
-  const successful = allTraces.filter(t => t.outcome === 'success').length;
-  const failed = allTraces.filter(t => t.outcome === 'failure').length;
+  const total = db.prepare('SELECT COUNT(*) as c FROM traces').get().c;
+  const active = db.prepare("SELECT COUNT(*) as c FROM traces WHERE status = 'active'").get().c;
+  const completed = total - active;
+  const successful = db.prepare("SELECT COUNT(*) as c FROM traces WHERE outcome = 'success'").get().c;
+  const failed = db.prepare("SELECT COUNT(*) as c FROM traces WHERE outcome = 'failure'").get().c;
 
-  const completedTraces = allTraces.filter(t => t.ended_at);
-  const durations = completedTraces.map(t =>
+  const durRows = db.prepare('SELECT started_at, ended_at FROM traces WHERE ended_at IS NOT NULL').all();
+  const durations = durRows.map(t =>
     new Date(t.ended_at).getTime() - new Date(t.started_at).getTime()
   );
   const avg_duration_ms = durations.length > 0
     ? Math.round(durations.reduce((a, b) => a + b, 0) / durations.length)
     : 0;
 
-  let total_events_count = 0;
-  let total_tool_calls_count = 0;
-  let total_decisions_count = 0;
-  let total_tokens = 0;
+  const total_spans = db.prepare('SELECT COUNT(*) as c FROM spans').get().c;
+  const total_tool_calls = db.prepare('SELECT COUNT(*) as c FROM tool_calls').get().c;
+  const total_decisions = db.prepare('SELECT COUNT(*) as c FROM decisions').get().c;
+  const total_events = total_tool_calls + total_decisions;
 
-  for (const [, evts] of events) {
-    total_events_count += evts.length;
-    for (const e of evts) {
-      if (e.type === 'tool_call') {
-        total_tool_calls_count++;
-        total_tokens += e.tokens_used || 0;
-      }
-      if (e.type === 'decision') total_decisions_count++;
-    }
-  }
+  const tokenRow = db.prepare('SELECT SUM(tokens_used) as s FROM tool_calls').get();
+  const total_tokens = tokenRow.s || 0;
 
   const success_rate = completed > 0 ? parseFloat((successful / completed).toFixed(3)) : 0;
 
@@ -309,10 +315,10 @@ export function getStats() {
     failed_traces: failed,
     success_rate,
     avg_duration_ms,
-    total_spans: spans.size,
-    total_events: total_events_count,
-    total_tool_calls: total_tool_calls_count,
-    total_decisions: total_decisions_count,
+    total_spans,
+    total_events,
+    total_tool_calls,
+    total_decisions,
     total_tokens,
     generated_at: new Date().toISOString(),
   };
