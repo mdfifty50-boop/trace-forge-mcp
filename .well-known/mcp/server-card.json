@@ -1,0 +1,48 @@
+{
+  "name": "trace-forge-mcp",
+  "version": "0.1.0",
+  "description": "Write-path observability MCP server — structured traces, spans, tool calls, and decision logs for EU AI Act traceability compliance",
+  "author": "THRONE",
+  "license": "MIT",
+  "transport": "stdio",
+  "tools": [
+    {
+      "name": "trace_start",
+      "description": "Begin a new trace for an agent task"
+    },
+    {
+      "name": "trace_span",
+      "description": "Create a span within a trace (supports nesting)"
+    },
+    {
+      "name": "trace_tool_call",
+      "description": "Log a tool call with duration, tokens, and status"
+    },
+    {
+      "name": "trace_decision",
+      "description": "Log an agent decision point with reasoning and alternatives"
+    },
+    {
+      "name": "trace_end",
+      "description": "Complete a trace with outcome and auto-calculated stats"
+    },
+    {
+      "name": "get_trace",
+      "description": "Retrieve full trace tree with spans, events, and decisions"
+    },
+    {
+      "name": "search_traces",
+      "description": "Find traces by agent ID and/or status"
+    }
+  ],
+  "resources": [
+    {
+      "uri": "traces://recent",
+      "description": "Last 20 traces with summary stats"
+    },
+    {
+      "uri": "traces://stats",
+      "description": "Aggregate statistics (total traces, avg duration, success rate)"
+    }
+  ]
+}
